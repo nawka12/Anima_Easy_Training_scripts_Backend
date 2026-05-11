@@ -202,13 +202,13 @@ def validate_args(args: dict) -> tuple[bool, list[str], dict]:
     return passed_validation, errors, output_args
 
 
-def validate_dataset_args(args: dict) -> tuple[bool, list[str], dict]:
+def _validate_single_dataset(args: dict) -> tuple[bool, list[str], dict]:
     passed_validation = True
     errors = []
     output_args = {"general": {}, "subsets": []}
 
     for key, value in args.items():
-        if (value is None or 
+        if (value is None or
                 (isinstance(value, str) and value.strip() == '')):
             passed_validation = False
             errors.append(f"No Data filled in for {key}")
@@ -216,15 +216,15 @@ def validate_dataset_args(args: dict) -> tuple[bool, list[str], dict]:
         if key == "subsets":
             continue
         for arg, val in value.items():
-            if (val is None or 
-                (isinstance(val, str) and val.strip() == '') or 
+            if (val is None or
+                (isinstance(val, str) and val.strip() == '') or
                 (isinstance(val, bool) and value == False)):
                 continue
             if arg == "max_token_length" and val == 75:
                 continue
             output_args["general"][arg] = val
 
-    for item in args["subsets"]:
+    for item in args.get("subsets", []):
         sub_res = validate_subset(item)
         if not sub_res[0]:
             passed_validation = False
@@ -232,6 +232,24 @@ def validate_dataset_args(args: dict) -> tuple[bool, list[str], dict]:
             continue
         output_args["subsets"].append(sub_res[2])
     return passed_validation, errors, output_args
+
+
+def validate_dataset_args(args: dict) -> tuple[bool, list[str], dict]:
+    # Multi-dataset (multi-resolution) shape: {"datasets": [{"general": {...}, "subsets": [...]}, ...]}
+    if "datasets" in args:
+        passed_validation = True
+        errors = []
+        output_args = {"datasets": []}
+        for i, dataset in enumerate(args["datasets"]):
+            ds_pass, ds_errors, ds_out = _validate_single_dataset(dataset)
+            if not ds_pass:
+                passed_validation = False
+                errors += [f"[dataset {i}] {e}" for e in ds_errors]
+            output_args["datasets"].append(ds_out)
+        return passed_validation, errors, output_args
+
+    # Legacy single-dataset shape: {"general": {...}, "subsets": [...]}
+    return _validate_single_dataset(args)
 
 
 def validate_subset(args: dict) -> tuple[bool, list[str], dict]:
@@ -318,9 +336,21 @@ def validate_sdxl(args: dict) -> bool:
 
 def validate_save_tags(dataset: dict) -> dict:
     tags = {}
-    for subset in dataset["subsets"]:
+    if "datasets" in dataset:
+        all_subsets = [s for ds in dataset["datasets"] for s in ds.get("subsets", [])]
+    else:
+        all_subsets = dataset.get("subsets", [])
+
+    # Dedupe by (image_dir, caption_extension): multi-res configs repeat the
+    # same subset across resolutions and we don't want to count tags N times.
+    seen: set[tuple[str, str]] = set()
+    for subset in all_subsets:
         if 'is_val' in subset and subset['is_val']:
             continue
+        key = (subset.get("image_dir", ""), subset.get("caption_extension", ""))
+        if key in seen:
+            continue
+        seen.add(key)
         subset_dir = Path(subset["image_dir"])
         if not subset_dir.is_dir():
             continue
@@ -352,14 +382,12 @@ def get_tags_from_file(file: str, tags: dict) -> None:
                 tags[tag] = 1
 
 
-def calculate_steps(
-    dataset_args: dict[str, dict | list[dict]],
-    num_epochs: int,
-    grad_acc_steps: int = 1,
-    num_processes: int = 1,
+def _calculate_steps_single(
+    general_args: dict,
+    subsets: list,
+    grad_acc_steps: int,
+    num_processes: int,
 ) -> int:
-    general_args: dict = dataset_args["general"]
-    subsets: list = dataset_args["subsets"]
     supported_types = [".png", ".jpg", ".jpeg", ".webp", ".bmp"]
     resolution = (
         (general_args["resolution"], general_args["resolution"])
@@ -380,6 +408,10 @@ def calculate_steps(
     else:
         bucketManager = BucketManager(False, resolution, None, None, None, False)
         bucketManager.set_predefined_resos([resolution])
+
+    # sd-scripts excludes images whose larger side is <= skip_image_resolution
+    # when the dataset is part of a multi-resolution training group.
+    skip_reso = general_args.get("skip_image_resolution", 0) or 0
     for subset in subsets:
         if 'is_val' in subset and subset['is_val']:
             continue
@@ -387,10 +419,31 @@ def calculate_steps(
             if image.suffix not in supported_types:
                 continue
             with Image.open(image) as img:
+                if skip_reso and max(img.width, img.height) <= skip_reso:
+                    continue
                 bucket_reso, _, _ = bucketManager.select_bucket(img.width, img.height)
                 for _ in range(subset["num_repeats"]):
                     bucketManager.add_image(bucket_reso, image)
-    steps_before_acc = sum(
+    return sum(
         math.ceil(len(bucket) / general_args["batch_size"]) for bucket in bucketManager.buckets
     )
+
+
+def calculate_steps(
+    dataset_args: dict[str, dict | list[dict]],
+    num_epochs: int,
+    grad_acc_steps: int = 1,
+    num_processes: int = 1,
+) -> int:
+    if "datasets" in dataset_args:
+        steps_before_acc = sum(
+            _calculate_steps_single(
+                ds.get("general", {}), ds.get("subsets", []), grad_acc_steps, num_processes
+            )
+            for ds in dataset_args["datasets"]
+        )
+    else:
+        steps_before_acc = _calculate_steps_single(
+            dataset_args["general"], dataset_args["subsets"], grad_acc_steps, num_processes
+        )
     return math.ceil(steps_before_acc / grad_acc_steps / num_processes) * num_epochs
