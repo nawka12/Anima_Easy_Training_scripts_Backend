@@ -68,7 +68,7 @@ def gram_newton_schulz_2step(
     # so I is never mutated.
     Q = I
 
-    # 5-step iteration with pre-optimized coefficients
+    # 2-step iteration with pre-optimized coefficients
     for step_idx, (a, b, c) in enumerate(GRAM_NEWTON_SCHULZ_2STEP_COEFFS1):
         # Cubic polynomial on Gram matrix
         R2 = R @ R
@@ -114,54 +114,6 @@ def filter_grad(grad, fft_alpha=1.0):
     # The result should be real, but take .real to discard negligible imaginary parts
     return modified_grad.real
 
-def create_gaussian_mask(shape, sigma=1.0, device='cpu'):
-    """
-    Creates a n-dimensional Gaussian mask, centered for use with fftshift.
-    """
-    freq_dims = [torch.fft.fftfreq(s, device=device) for s in shape]
-    # Center the grid for radial calculation
-    shifted_freq_dims = [torch.fft.ifftshift(d) for d in freq_dims]
-
-    # Create a meshgrid of coordinates
-    coords = torch.stack(torch.meshgrid(*shifted_freq_dims, indexing='ij'))
-
-    # Calculate the radial distance (L2 norm) from the center (zero frequency)
-    # Normalize by the max possible frequency radius for scale invariance
-    max_radius = 0.5 * math.sqrt(len(shape))
-    radius = torch.linalg.norm(coords, dim=0) / max_radius
-
-    # Create a Gaussian low-pass filter.
-    # Higher alpha means sharper decay, i.e., more aggressive filtering
-    filter_weights = torch.exp(-sigma * (radius ** 2))
-    return filter_weights
-
-def similarity_fft(grad, prev_grad, sigma=0.0):
-    # 1. Apply n-dimensional FFT
-    grad_freq = torch.fft.fftn(grad, norm='ortho')
-    prev_grad_freq = torch.fft.fftn(prev_grad, norm='ortho')
-
-    grad_freq_shifted = torch.fft.fftshift(grad_freq)
-    prev_grad_freq_shifted = torch.fft.fftshift(prev_grad_freq)
-
-    agreement_mask = grad_freq_shifted.abs() * prev_grad_freq_shifted.abs().conj()
-
-    mask_max = torch.max(agreement_mask.abs())
-    if mask_max > 1e-16:
-        agreement_mask /= mask_max
-
-    new_grad_fft = grad_freq_shifted * agreement_mask.real
-
-    if sigma != 0:
-        gaussian_mask = create_gaussian_mask(grad.shape, sigma=sigma, device=grad.device)
-        new_grad_fft = new_grad_fft * gaussian_mask
-
-    new_grad_fft = torch.fft.ifftshift(new_grad_fft)
-
-    new_grad = torch.fft.ifftn(new_grad_fft, norm='ortho').real
-
-    return new_grad
-
-
 def _reshape_to_2d(t: torch.Tensor) -> torch.Tensor:
     """Reshape tensor to 2D: [N, -1] for >2D, [1, -1] for 1D, identity for 2D."""
     if t.ndim > 2:
@@ -189,6 +141,10 @@ class OCGOptV2(Optimizer):
             AdamW-like weight decay, i.e. a L2 penalty (default: 0.0).
         weight_decay_rate (float):
             Decay the multiplier at which rate weight decay is applied, weight_decay * weight_decay_rate**step - Visualization: https://www.desmos.com/calculator/ipgbjovebr - (default: 0.995).
+        cautious_weight_decay (bool):
+            Apply weight decay only where the gradient and parameter agree in sign,
+            preventing weight decay from fighting the gradient direction.
+            Based on Cautious Optimizers — https://arxiv.org/abs/2411.16085 (default: False).
         centralization (float):
             Subtract the full gradient momentum from the current gradient at this ratio (default: 1.0).
         spectral_adaptive (bool):
@@ -196,9 +152,9 @@ class OCGOptV2(Optimizer):
         spectral_clip_compile (bool):
             Compile the spectral clip function (Highly recommended for a large speed increase) (default: True).
         spectral_clip_dtype (torch.dtype in string format):
-            Sets the dtype of spectral clipping calculation. Recommended to use torch.float32 (or leave at default of None) (default: None, which results in torch.float32).
+            Sets the dtype of spectral clipping calculation. Recommended to use torch.float32 (or leave at default of None) (default: None, which results in torch.bfloat16).
         adaptive (bool):
-            Scale the full step to the momentumized average gradient, always utilizes RMS normalization on the gradient if True, otherwise caps RMS at 1.0 (default: True).
+            Scale the full step to the momentumized average gradient, always utilizes RMS normalization on the gradient if True, otherwise caps RMS at 1.0 (default: False).
         adaptive_min (float):
             Minimum multiplier for the adaptive scale (default: -1.0).
         adaptive_max (float):
@@ -209,10 +165,6 @@ class OCGOptV2(Optimizer):
             Use RMS variant of AOL (Almost-Orthogonal-Layer) preconditioning on the input gradient instead of regular RMS normalization. Computes Gram matrix and rescales rows by inverse sqrt of absolute row sums (default: False).
         lowpass_grad (float):
             Pre-conditions the gradient via a low-pass filter that maintains the direction of the gradient. Higher = stronger filtering, 0 = disabled (default: 0.0).
-        sim_match (bool):
-            Filters the frequencies of the running average with the gradient of the current step's frequencies (default: False).
-        cautious_min (float):
-            A value other than 1.0 will utilize cautious-stepping. At 0.0, this zeros out parts of the momentum which don't correlate with the current gradient's direction. 0.5 will halve it instead (default: 0.0).
         stochastic_fp (bool):
             Utilize stochastic rounding for bf16 and fp16 tensors. (default: True).
         compile_step (bool):
@@ -241,6 +193,7 @@ class OCGOptV2(Optimizer):
         betas: float = (0.95, 0.9975, 0.9999),
         weight_decay: float = 0.0,
         weight_decay_rate: float = 0.995,
+        cautious_weight_decay: bool = False,
         centralization: float = 1.0,
         spectral_adaptive: bool = True,
         spectral_clip_compile: bool = True,
@@ -251,7 +204,6 @@ class OCGOptV2(Optimizer):
         input_norm: bool = False,
         aol: bool = False,
         lowpass_grad: float = 0.0,
-        cautious_min: float = 0.0,
         stochastic_fp: bool = True,
         compile_step: bool = False,
         foreach: bool = False,
@@ -291,6 +243,7 @@ class OCGOptV2(Optimizer):
             betas = betas,
             weight_decay = weight_decay,
             weight_decay_rate = weight_decay_rate,
+            cautious_weight_decay = cautious_weight_decay,
             centralization = centralization,
             spectral_adaptive = spectral_adaptive,
             spectral_clip_compile = spectral_clip_compile,
@@ -301,7 +254,6 @@ class OCGOptV2(Optimizer):
             input_norm = input_norm,
             aol = aol,
             lowpass_grad = lowpass_grad,
-            cautious_min = cautious_min,
             stochastic_fp = stochastic_fp,
             foreach = foreach,
         )
@@ -403,6 +355,7 @@ class OCGOptV2(Optimizer):
         do_input_norm:         bool,          # True when input_norm AND dimcount >= 1
         do_adaptive:           bool,          # True when adaptive is enabled
         do_weight_decay:       bool,          # True when weight_decay != 0
+        do_cautious_wd:        bool,          # True when cautious_weight_decay AND weight_decay != 0
         spectral_adaptive:     bool,          # adaptive spectral clipping flag
         is_scalar:             bool,          # True when dimcount < 1
         is_1d:                 bool,          # True when dimcount == 1
@@ -456,8 +409,9 @@ class OCGOptV2(Optimizer):
                 grad_2d = grad
             rms = grad_2d.pow(2).mean(dim=1, keepdim=True).sqrt_().clamp_min_(1e-16)
             grad = grad_2d.div(rms).reshape_as(grad)
-        else:
-            # Global RMS normalization (also used for scalar tensors)
+        elif not do_aol:
+            # Global RMS normalization (for scalar tensors and non-scalar without AOL/input_norm).
+            # Skipped when do_aol is True: AOL already provides normalization.
             rms = grad.pow(2).mean().sqrt_().clamp_min_(1e-16)
             grad = grad.div(rms)
 
@@ -530,7 +484,11 @@ class OCGOptV2(Optimizer):
 
         # ---- 13. Decoupled weight decay ---------------------------------
         if do_weight_decay:
-            full_step = full_step + p_data * wd_mul_t
+            if do_cautious_wd:
+                cwd_mask = (grad * p_data >= 0).to(full_step.dtype)
+                full_step = full_step + p_data * wd_mul_t * cwd_mask
+            else:
+                full_step = full_step + p_data * wd_mul_t
 
         # ---- 14. Parameter update ---------------------------------------
         p_data.sub_(full_step * lr_t)
@@ -557,6 +515,7 @@ class OCGOptV2(Optimizer):
             beta1, beta2, beta3 = group["betas"][0], group["betas"][1], group["betas"][2]
             weight_decay = group["weight_decay"]
             weight_decay_rate = group["weight_decay_rate"]
+            cautious_weight_decay = group["cautious_weight_decay"]
             centralization = group["centralization"]
             stochastic_fp = group["stochastic_fp"]
             lowpass_grad = group["lowpass_grad"]
@@ -656,6 +615,7 @@ class OCGOptV2(Optimizer):
                     input_norm and not is_scalar, # do_input_norm
                     adaptive,                     # do_adaptive
                     weight_decay != 0,            # do_weight_decay
+                    cautious_weight_decay and weight_decay != 0,  # do_cautious_wd
                     spectral_adaptive,
                     is_scalar,
                     dimcount == 1,                # is_1d
@@ -720,6 +680,7 @@ class OCGOptV2(Optimizer):
             beta1, beta2, beta3 = group["betas"][0], group["betas"][1], group["betas"][2]
             weight_decay = group["weight_decay"]
             weight_decay_rate = group["weight_decay_rate"]
+            cautious_weight_decay = group["cautious_weight_decay"]
             centralization = group["centralization"]
             stochastic_fp = group["stochastic_fp"]
             lowpass_grad = group["lowpass_grad"]
@@ -828,7 +789,11 @@ class OCGOptV2(Optimizer):
 
                 # Weight decay
                 if wd_mul != 0:
-                    full_step.add_(p_fp32.data, alpha=wd_mul)
+                    if cautious_weight_decay:
+                        cwd_mask = (grad * p_fp32.data >= 0).to(full_step.dtype)
+                        full_step.add_(p_fp32.data * cwd_mask, alpha=wd_mul)
+                    else:
+                        full_step.add_(p_fp32.data, alpha=wd_mul)
 
                 # Parameter update
                 p_fp32.data.add_(full_step, alpha=-lr)
@@ -943,13 +908,15 @@ class OCGOptV2(Optimizer):
                     A = grad_2d @ grad_2d.mT
                     rescaling = A.abs().sum(dim=-1, keepdim=True).clamp_min_(1e-16)
                     grad_2d = grad_2d * rescaling.rsqrt()
-                    grad = grad_2d.view_as(grad)
+                    grad = grad_2d.reshape_as(grad)
 
                 if input_norm:
                     grad_2d = _reshape_to_2d(grad)
                     rms = grad_2d.pow(2).mean(dim=1, keepdim=True).sqrt_().clamp_min_(1e-16)
-                    grad = grad_2d.div(rms).view_as(grad)
-                else:
+                    grad = grad_2d.div(rms).reshape_as(grad)
+                elif not aol:
+                    # Global RMS normalization (for scalar tensors and non-scalar without AOL/input_norm).
+                    # Skipped when aol is True: AOL already provides normalization.
                     rms = grad.pow(2).mean().sqrt_().clamp_min_(1e-16)
                     grad = grad.div(rms)
 
@@ -1009,7 +976,7 @@ class OCGOptV2(Optimizer):
                 if flip:
                     exp_avg_2d_o = exp_avg_2d_o.T
 
-                full_step = exp_avg_2d_o.view_as(exp_avg)
+                full_step = exp_avg_2d_o.reshape_as(exp_avg)
                 full_step = full_step.div(full_step.pow(2).mean().sqrt_().clamp_min_(1))
 
                 full_step_list[idx] = full_step
@@ -1039,7 +1006,12 @@ class OCGOptV2(Optimizer):
 
             # ==== BATCH: Decoupled weight decay ==============================
             if wd_mul != 0:
-                torch._foreach_add_(full_step_list, p_fp32_list, alpha=wd_mul)
+                if cautious_weight_decay:
+                    for idx in range(n):
+                        cwd_mask = (grad_list[idx] * p_fp32_list[idx] >= 0).to(full_step_list[idx].dtype)
+                        full_step_list[idx] = full_step_list[idx] + p_fp32_list[idx] * wd_mul * cwd_mask
+                else:
+                    torch._foreach_add_(full_step_list, p_fp32_list, alpha=wd_mul)
 
             # ==== BATCH: Parameter update ====================================
             torch._foreach_add_(p_fp32_list, full_step_list, alpha=-lr)
@@ -1138,6 +1110,7 @@ class OCGOptV2(Optimizer):
             beta1, beta2, beta3 = group["betas"][0], group["betas"][1], group["betas"][2]
             weight_decay = group["weight_decay"]
             weight_decay_rate = group["weight_decay_rate"]
+            cautious_weight_decay = group.get("cautious_weight_decay", False)
             centralization = group["centralization"]
 
             step = group['step']
@@ -1207,15 +1180,17 @@ class OCGOptV2(Optimizer):
                     rescaling = A.abs().sum(dim=-1, keepdim=True).clamp_min_(1e-16)
                     grad_2d = grad_2d * rescaling.rsqrt()
 
-                    grad = grad_2d.view_as(grad)
+                    grad = grad_2d.reshape_as(grad)
 
                 if dimcount >= 1 and group["input_norm"]:
                     grad_2d = _reshape_to_2d(grad)
 
                     rms = grad_2d.pow(2).mean(dim=1, keepdim=True).sqrt_().clamp_min_(1e-16) # Cap at RMS of 1.0
 
-                    grad = grad_2d.div(rms).view_as(grad)
-                else:
+                    grad = grad_2d.div(rms).reshape_as(grad)
+                elif not (dimcount >= 1 and group["aol"]):
+                    # Global RMS normalization (for scalar tensors and non-scalar without AOL/input_norm).
+                    # Skipped when aol is True: AOL already provides normalization.
                     rms = grad.pow(2).mean().sqrt_().clamp_min_(1e-16) # Cap at RMS of 1.0
                     grad = grad.div(rms)
 
@@ -1256,7 +1231,7 @@ class OCGOptV2(Optimizer):
                     if flip:
                         exp_avg_2d_o = exp_avg_2d_o.T
 
-                    full_step = exp_avg_2d_o.view_as(exp_avg)
+                    full_step = exp_avg_2d_o.reshape_as(exp_avg)
 
                     full_step = full_step.div(full_step.pow(2).mean().sqrt_().clamp_min_(1))
                 else:
@@ -1276,7 +1251,11 @@ class OCGOptV2(Optimizer):
 
                 # Perform weight decay (using pre-computed group-level multiplier)
                 if _wd_mul != 0:
-                    full_step.add_(p_fp32.data, alpha=_wd_mul)
+                    if cautious_weight_decay:
+                        cwd_mask = (grad * p_fp32.data >= 0).to(full_step.dtype)
+                        full_step.add_(p_fp32.data * cwd_mask, alpha=_wd_mul)
+                    else:
+                        full_step.add_(p_fp32.data, alpha=_wd_mul)
 
                 p_fp32.data.add_(full_step, alpha=-lr)
 

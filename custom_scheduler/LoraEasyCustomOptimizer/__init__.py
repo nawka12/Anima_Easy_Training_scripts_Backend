@@ -58,11 +58,19 @@ from LoraEasyCustomOptimizer.wiwiopt import WiwiOpt
 from LoraEasyCustomOptimizer.adam import AdamW8bitKahan
 from LoraEasyCustomOptimizer.cascade import CASCADE
 from LoraEasyCustomOptimizer.radam_schedulefree import RAdamScheduleFree
+from LoraEasyCustomOptimizer.nor_muon_schedulefree import NorMuonScheduleFree
 from LoraEasyCustomOptimizer.ocgoptv2 import OCGOptV2
+from LoraEasyCustomOptimizer.adamw_schedulefree_plus import AdamWScheduleFreePlus
+from LoraEasyCustomOptimizer.amuse import AMUSE
+from LoraEasyCustomOptimizer.soda import SODA
+from LoraEasyCustomOptimizer.moda import MODA
+from LoraEasyCustomOptimizer.soda_wrapper import SODAWrapper
 
 OPTIMIZER_LIST: List[OPTIMIZER] = [
     ABMOG,
     AdamW8bitKahan,
+    AdamWScheduleFreePlus,
+    AMUSE,
     ADOPT,
     ADOPTAOScheduleFree,
     ADOPTEMAMixScheduleFree,
@@ -115,9 +123,11 @@ OPTIMIZER_LIST: List[OPTIMIZER] = [
     LPFAdamW,
     LaProp,
     Lion_adv,
+    MODA,
     MomentusCaution,
     Mythical,
     OAGOpt,
+    NorMuonScheduleFree,
     OCGOpt,
     OCGOptV2,
     ProdigyPlusScheduleFree,
@@ -141,6 +151,8 @@ OPTIMIZER_LIST: List[OPTIMIZER] = [
     SimplifiedAdEMAMixExM,
     SingState,
     SNOO_ASGD,
+    SODA,
+    SODAWrapper,
     StableSPAM,
     TALON,
     VSGD,
