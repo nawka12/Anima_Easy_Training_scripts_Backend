@@ -1,4 +1,4 @@
 [submodule "sd_scripts"]
 	path = sd_scripts
 	url = https://github.com/nawka12/sd-scripts
-	branch = dual-caption-extension
+	branch = sd3-upstream
