@@ -138,6 +138,7 @@ def validate(body: dict):
 
     ds_general = dataset.get("general_args", {}) or {}
     bucket = dataset.get("bucket_args", {}) or {}
+    caption_args = dataset.get("caption_args", {}) or {}
     subsets_in = dataset.get("subsets", []) or []
 
     num_gpus = (
@@ -236,6 +237,19 @@ def validate(body: dict):
         main["adapter"] = adapter_cfg
     main["optimizer"] = optimizer_cfg
     main["monitoring"] = monitoring_cfg
+
+    # Multi-caption: build a captions.json per subset from .txt (tags) + .caption
+    # (NL). With online_captions on and enable_random_caption OFF, diffusion-pipe
+    # trains one example per caption variant, so images with both files are seen
+    # twice per epoch. Only when the whole payload is valid, to avoid writing
+    # files on a failed validation.
+    if _as_bool(caption_args.get("combine_txt_caption")) and not errors:
+        from utils.captions import build_captions_json
+
+        built = sum(1 for subset in subsets_out if build_captions_json(Path(subset["path"])))
+        if built:
+            dataset_cfg["online_captions"] = True
+            # enable_random_caption stays off -> train on every variant.
 
     tags = _collect_tags(subsets_out)
 
