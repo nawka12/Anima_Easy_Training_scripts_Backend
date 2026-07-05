@@ -121,8 +121,9 @@ def setup_venv(uv: str, venv_path: str = "venv"):
     uv_pip_install(uv, "-r", "diffusion_pipe/requirements.txt", venv_path=venv_path)
     # Starlette / uvicorn / tunnel deps for the HTTP server itself.
     uv_pip_install(uv, "-r", "requirements.txt", venv_path=venv_path)
-    # Frontend-side deps shared with the backend process.
-    uv_pip_install(uv, "-r", "../requirements.txt", venv_path=venv_path)
+    # NOTE: the backend is self-contained (it can be cloned standalone on a
+    # remote/GPU box). It must NOT depend on the frontend's UI requirements
+    # (PySide6 / qt-material) — those install with the frontend, not here.
 
 
 # colab only
