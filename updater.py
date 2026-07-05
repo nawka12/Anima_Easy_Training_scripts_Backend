@@ -9,12 +9,14 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 def main():
-    # diffusion_pipe submodule + its ComfyUI sub-submodule (the `comfy` package
-    # is a core dependency; see installer.py). Other sub-submodules are for model
-    # families we don't train and are not pulled.
+    # diffusion_pipe submodule + the two sub-submodules on its unconditional
+    # import path: ComfyUI (`comfy`) and HunyuanVideo (`hyvideo`). Both are core
+    # dependencies (see installer.py). Other sub-submodules are lazy-imported per
+    # model type and are not pulled.
     check_call("git submodule update --init diffusion_pipe", shell=PLATFORM == "linux")
     check_call(
-        "git -C diffusion_pipe submodule update --init submodules/ComfyUI",
+        "git -C diffusion_pipe submodule update --init "
+        "submodules/ComfyUI submodules/HunyuanVideo",
         shell=PLATFORM == "linux",
     )
 
