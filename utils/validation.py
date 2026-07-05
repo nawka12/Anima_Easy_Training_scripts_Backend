@@ -114,6 +114,27 @@ def _toml_literal(text: str):
     return text
 
 
+def _coerce_opt_value(value):
+    """Coerce a UI optimizer-arg value into a properly typed TOML value.
+
+    Optimizer args come from free-text fields, so they arrive as strings and
+    would otherwise be written to the TOML as quoted strings — which breaks
+    optimizers that do arithmetic/validation on them (e.g. Prodigy unpacking a
+    ``betas`` string into characters). Scalars go through ``_toml_literal``
+    (bool/int/float/str); comma-separated or bracketed values (e.g. betas
+    ``"0.9,0.999"``) become a list of coerced scalars.
+    """
+    if isinstance(value, (list, tuple)):
+        return [_coerce_opt_value(v) for v in value]
+    if not isinstance(value, str):
+        return value
+    inner = value.strip().strip("()[]")
+    if "," in inner:
+        parts = [p.strip() for p in inner.split(",") if p.strip()]
+        return [_toml_literal(p) for p in parts]
+    return _toml_literal(value)
+
+
 def validate(body: dict):
     errors: list[str] = []
     if "args" not in body:
@@ -408,13 +429,15 @@ def _build_optimizer(group: dict, main: dict):
     else:
         cfg["lr"] = lr
 
-    # Inlined optimizer sub-args (betas, weight_decay, eps, ...).
+    # Inlined optimizer sub-args (betas, weight_decay, eps, ...). These arrive
+    # as free-text strings from the UI, so coerce them to real numbers/bools/
+    # lists before they reach the optimizer (a string betas breaks Prodigy).
     sub = group.get("optimizer_args", {}) or {}
     if isinstance(sub, dict):
         for key, value in sub.items():
             if _blank(value):
                 continue
-            cfg[key] = value
+            cfg[key] = _coerce_opt_value(value)
 
     # top-level training keys derived from the optimizer group
     max_grad_norm = _as_float(_first(group, "max_grad_norm", "gradient_clipping"))
