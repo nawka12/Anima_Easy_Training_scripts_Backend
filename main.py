@@ -172,6 +172,11 @@ async def start_training(request: Request) -> JSONResponse:
         )
 
     train_script = Path("diffusion_pipe/train.py").resolve()
+    # diffusion-pipe loads its bundled tokenizer/config dirs (configs/qwen3_06b,
+    # configs/t5_old) via paths RELATIVE to the cwd, so the trainer must run with
+    # its own directory as the working directory. Everything else in the command
+    # (train.py, --config, and the paths inside the TOMLs) is already absolute.
+    dp_dir = train_script.parent
     cmd = [
         "deepspeed",
         f"--num_gpus={num_gpus}",
@@ -188,7 +193,9 @@ async def start_training(request: Request) -> JSONResponse:
     # deepspeed forks worker processes; start them in a fresh process group so
     # stop_training can signal the whole group (terminate() on the launcher
     # alone orphans the workers, which keep the GPU memory pinned).
-    app.state.TRAINING_THREAD = subprocess.Popen(cmd, env=env, preexec_fn=os.setsid)
+    app.state.TRAINING_THREAD = subprocess.Popen(
+        cmd, env=env, cwd=str(dp_dir), preexec_fn=os.setsid
+    )
     if (
         "kill_tunnel_on_train_start" in server_config_dict
         and server_config_dict["kill_tunnel_on_train_start"]
