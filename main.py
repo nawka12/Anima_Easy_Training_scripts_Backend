@@ -10,6 +10,7 @@ from utils.process import write_configs
 from pathlib import Path
 import subprocess
 import signal
+import atexit
 from utils.tunnel_service import CloudflaredTunnel, create_tunnel
 import uvicorn
 import os
@@ -208,21 +209,34 @@ async def start_training(request: Request) -> JSONResponse:
     return JSONResponse({"detail": "Training Started", "training": True})
 
 
-async def stop_training(request: Request) -> JSONResponse:
-    force = request.query_params.get("force", "False").lower() in ("true", "1")
+def _kill_training_group(sig: int) -> bool:
+    """Signal the whole trainer process group; return True if a live trainer
+    was signalled.
+
+    deepspeed is launched in its own process group (os.setsid), so signalling
+    the group kills the forked workers too and releases the GPU + master port.
+    Falls back to the launcher pid if the group is already gone.
+    """
     thread = app.state.TRAINING_THREAD
     if not thread or thread.poll() is not None:
+        return False
+    try:
+        os.killpg(os.getpgid(thread.pid), sig)
+    except ProcessLookupError:
+        try:
+            thread.send_signal(sig)
+        except ProcessLookupError:
+            return False
+    return True
+
+
+async def stop_training(request: Request) -> JSONResponse:
+    force = request.query_params.get("force", "False").lower() in ("true", "1")
+    if not _kill_training_group(signal.SIGKILL if force else signal.SIGTERM):
         return JSONResponse(
             {"detail": "Not Currently Training"},
             status_code=status.HTTP_400_BAD_REQUEST,
         )
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    # Signal the whole process group so deepspeed's forked workers die too and
-    # release the GPU. Fall back to the launcher pid if the group is already gone.
-    try:
-        os.killpg(os.getpgid(thread.pid), sig)
-    except ProcessLookupError:
-        thread.send_signal(sig)
     if force:
         return JSONResponse({"detail": "Training Thread Killed"})
     return JSONResponse({"detail": "Training Thread Requested to Die"})
@@ -287,6 +301,25 @@ uvi_config = uvicorn.Config(
     port=config_data.get("port", 8000),
 )
 server = uvicorn.Server(config=uvi_config)
+
+
+def _cleanup_training_on_exit():
+    """Ensure the detached deepspeed trainer doesn't outlive the server.
+
+    The trainer runs in its own process group, so a Ctrl-C on run.sh (SIGINT)
+    or a `kill` (SIGTERM) reaches uvicorn but NOT the trainer group, orphaning
+    it — it keeps holding the GPU and the master port (EADDRINUSE on the next
+    run). uvicorn handles SIGINT/SIGTERM gracefully and returns from run(), so
+    this atexit hook fires on the way out and tears the group down.
+    """
+    if _kill_training_group(signal.SIGTERM):
+        try:
+            app.state.TRAINING_THREAD.wait(timeout=10)
+        except Exception:
+            _kill_training_group(signal.SIGKILL)
+
+
+atexit.register(_cleanup_training_on_exit)
 
 if __name__ == "__main__":
     server.run()
