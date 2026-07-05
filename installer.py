@@ -205,7 +205,10 @@ def main():
     logger.info("creating venv and installing requirements")
     uv = ensure_uv()
     # Backend-level venv (shared by the HTTP server and the deepspeed trainer).
-    venv_path = create_venv(uv, "venv", "3.11")
+    # Python 3.12 is required: diffusion-pipe's latent cache uses
+    # sqlite3.connect(autocommit=...), a 3.12+ API (utils/cache.py), and
+    # upstream itself targets 3.12.
+    venv_path = create_venv(uv, "venv", "3.12")
 
     if len(sys.argv) > 1 and sys.argv[1] == "colab":
         setup_colab(uv, venv_path)
