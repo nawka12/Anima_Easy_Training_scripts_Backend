@@ -243,7 +243,13 @@ def validate(body: dict):
             main[key] = value
 
     # ---- dataset.toml ------------------------------------------------------
-    dataset_cfg, subsets_out, dataset_errors = _build_dataset(ds_general, bucket, subsets_in)
+    # Global caption knobs (shuffle_caption / keep_tokens / ...) arrive in the
+    # caption_args group from the frontend Captions panel; overlay them onto
+    # the dataset general group so _build_dataset picks them up.
+    caption_overlay = {k: v for k, v in caption_args.items() if k != "combine_txt_caption"}
+    dataset_cfg, subsets_out, dataset_errors = _build_dataset(
+        {**ds_general, **caption_overlay}, bucket, subsets_in
+    )
     errors += dataset_errors
 
     # ---- warmup_ratio -> warmup_steps (needs dataset + epochs) -------------
