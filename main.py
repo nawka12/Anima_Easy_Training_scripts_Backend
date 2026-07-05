@@ -191,6 +191,10 @@ async def start_training(request: Request) -> JSONResponse:
     print(f"Launching diffusion-pipe: {' '.join(cmd)}")
 
     env = {**os.environ, "NCCL_P2P_DISABLE": "1", "NCCL_IB_DISABLE": "1"}
+    # Reduce CUDA fragmentation OOMs (large "reserved but unallocated" gaps) by
+    # letting the allocator grow segments. setdefault so an explicit user
+    # override in the environment still wins.
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     # deepspeed forks worker processes; start them in a fresh process group so
     # stop_training can signal the whole group (terminate() on the launcher
     # alone orphans the workers, which keep the GPU memory pinned).
