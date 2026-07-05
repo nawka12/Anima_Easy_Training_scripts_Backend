@@ -1,449 +1,673 @@
+"""Validate the frontend payload and translate it into diffusion-pipe configs.
+
+The frontend still POSTs the same envelope to ``/validate``::
+
+    {"args": {...groups...}, "dataset": {...}, "accelerate": {...}}
+
+but the *vocabulary* inside each group is now the diffusion-pipe one (see
+BACK-MIGRATE.md §4 / §9). ``validate`` returns three ready-to-serialize dicts
+-- one per output TOML -- plus caption tag counts:
+
+    (passed, errors, main_config, dataset_config, sample_config, tags)
+
+``sample_config`` is ``None`` when there are no sample prompts. Downstream,
+``utils.process.write_configs`` writes ``runtime_store/{main,dataset,sample}.toml``
+and cross-references them by absolute path.
+"""
+from __future__ import annotations
+
 from pathlib import Path
-import json
-
-from library.train_util import BucketManager
-from PIL import Image
 import math
-from LoraEasyCustomOptimizer import OPTIMIZERS
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif", ".jxl"}
+
+# sd_scripts mixed_precision names -> diffusion-pipe dtype names.
+DTYPE_MAP = {
+    "bf16": "bfloat16",
+    "fp16": "float16",
+    "fp32": "float32",
+    "float": "float32",
+    "no": "float32",
+    "bfloat16": "bfloat16",
+    "float16": "float16",
+    "float32": "float32",
+    "float8": "float8",
+    "fp8": "float8",
+}
+
+# Optimizer name map. Anything not here is passed through verbatim so the
+# pytorch_optimizer library can resolve it (train.py getattr, case-sensitive).
+# Keys are matched case-insensitively.
+OPTIMIZER_NAME_MAP = {
+    "adamw": "adamw_optimi",
+    "adamw_optimi": "adamw_optimi",
+    "adamwoptimi": "adamw_optimi",
+    "adamw8bit": "AdamW8bitKahan",
+    "adamw8bitkahan": "AdamW8bitKahan",
+    "stableadamw": "stableadamw",
+    "sgd": "sgd",
+    "offload": "offload",
+    "automagic": "automagic",
+    "prodigy": "Prodigy",
+    "came": "CAME",
+}
+
+VALID_TIMESTEP_METHODS = {"logit_normal", "uniform"}
+VALID_LR_SCHEDULERS = {"constant", "linear", "cosine"}
+ADAPTER_TYPES = {"lora", "lokr"}
 
 
-def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict]:
-    over_errors = []
-    if "args" not in args:
-        over_errors.append("args is not present")
-    if "dataset" not in args:
-        over_errors.append("dataset is not present")
-    if over_errors:
-        return False, False, over_errors, {}, {}
-    args_pass, args_errors, args_data = validate_args(args["args"])
-    dataset_pass, dataset_errors, dataset_data = validate_dataset_args(args["dataset"])
-    over_pass = args_pass and dataset_pass
-    over_errors = args_errors + dataset_errors
-
-    # Process log prefix mode regardless of initial pass status, but add errors if needed
-    if "log_prefix_mode" in args_data:
-        mode = args_data["log_prefix_mode"]
-        if mode == "output_name":
-            # Check if output_name exists and is not empty (comes from saving_args)
-            if "output_name" in args_data and args_data["output_name"]:
-                args_data["log_prefix"] = args_data["output_name"] + "_"
-            else:
-                # Error only if output_name is expected but missing/empty
-                over_errors.append("Log Prefix Mode is 'Output Name', but 'Output Name' in Saving Args is missing or empty.")
-                over_pass = False # Mark overall validation as failed
-        elif mode == "manual":
-            # Check if log_prefix exists (set by logging UI) and is not empty
-            if "log_prefix" not in args_data or not args_data.get("log_prefix", ""):
-                over_errors.append("Log Prefix Mode is 'Manual', but the 'Manual Prefix' is missing or empty.")
-                over_pass = False # Mark overall validation as failed
-        elif mode == "disabled":
-            if "log_prefix" in args_data:
-                # Clean up if prefix exists but mode is disabled
-                del args_data["log_prefix"]
-        if "log_prefix_mode" in args_data: del args_data["log_prefix_mode"]
-
-    if "run_name_mode" in args_data:
-        mode = args_data["run_name_mode"]
-        if mode == "output_name":
-            if "output_name" in args_data and args_data["output_name"]:
-                args_data["wandb_run_name"] = args_data["output_name"]
-            else:
-                # Error only if output_name is expected but missing/empty
-                over_errors.append("Log Prefix Mode is 'Output Name', but 'Output Name' in Saving Args is missing or empty.")
-                over_pass = False # Mark overall validation as failed
-        elif mode == "manual":
-            if "run_name" not in args_data or not args_data.get("run_name", ""):
-                over_errors.append("Log Prefix Mode is 'Manual', but the 'Manual Run Name' is missing or empty.")
-                over_pass = False # Mark overall validation as failed
-                args_data["wandb_run_name"] = args_data["run_name"]
-        elif mode == "default":
-            if "run_name" in args_data:
-                del args_data["run_name"]
-        if "run_name_mode" in args_data: del args_data["run_name_mode"]
-
-    # Get num_processes from accelerate settings for multi-GPU step calculations
-    accelerate = args.get("accelerate", {})
-    num_processes = accelerate.get("num_processes", 1) if accelerate.get("enabled", False) else 1
-
-    tag_data = {}
-    if not over_errors:
-        validate_warmup_ratio(args_data, dataset_data, num_processes)
-        validate_restarts(args_data, dataset_data, num_processes)
-        tag_data = validate_save_tags(dataset_data)
-        validate_existing_files(args_data)
-        validate_optimizer(args_data)
-    sdxl = validate_sdxl(args_data)
-    return over_pass, sdxl, over_errors, args_data, dataset_data, tag_data
+def _blank(value) -> bool:
+    return value is None or (isinstance(value, str) and value.strip() == "")
 
 
-def validate_args(args: dict) -> tuple[bool, list[str], dict]:
-    # sourcery skip: low-code-quality
-    passed_validation = True
-    errors = []
-    output_args = {}
+def _as_bool(value, default=False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    if value is None:
+        return default
+    return bool(value)
 
-    for key, value in args.items():
-        if (value is None or 
-            (isinstance(value, str) and value.strip() == '')):
-            passed_validation = False
-            errors.append(f"No data filled in for {key}")
+
+def _as_float(value, default=None):
+    if _blank(value):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value, default=None):
+    if _blank(value):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _first(group: dict, *keys, default=None):
+    """Return the first present, non-blank value among ``keys``."""
+    for key in keys:
+        if key in group and not _blank(group[key]):
+            return group[key]
+    return default
+
+
+def _toml_literal(text: str):
+    """Best-effort parse of a free-form extra_arg value into a TOML scalar."""
+    s = text.strip()
+    low = s.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return text
+
+
+def validate(body: dict):
+    errors: list[str] = []
+    if "args" not in body:
+        errors.append("'args' is not present in the payload")
+    if "dataset" not in body:
+        errors.append("'dataset' is not present in the payload")
+    if errors:
+        return False, errors, {}, {}, None, {}
+
+    args = body.get("args", {}) or {}
+    dataset = body.get("dataset", {}) or {}
+    accelerate = body.get("accelerate", {}) or {}
+
+    general = args.get("general_args", {}) or {}
+    model_group = args.get("anima_args", args.get("model_args", {})) or {}
+    network = args.get("network_args", {}) or {}
+    optimizer = args.get("optimizer_args", {}) or {}
+    saving = args.get("saving_args", {}) or {}
+    sample = args.get("sample_args", {}) or {}
+    logging_group = args.get("logging_args", {}) or {}
+    extra = args.get("extra_args", {}) or {}
+
+    ds_general = dataset.get("general_args", {}) or {}
+    bucket = dataset.get("bucket_args", {}) or {}
+    subsets_in = dataset.get("subsets", []) or []
+
+    num_gpus = (
+        _as_int(accelerate.get("num_processes"), 1)
+        if _as_bool(accelerate.get("enabled"))
+        else 1
+    ) or 1
+
+    main: dict = {}
+
+    # ---- dtype / precision -------------------------------------------------
+    mixed_precision = _first(general, "mixed_precision", "dtype", default="bf16")
+    model_dtype = DTYPE_MAP.get(str(mixed_precision).lower(), "bfloat16")
+
+    # ---- [model] -----------------------------------------------------------
+    model_cfg, model_errors = _build_model(model_group, model_dtype)
+    errors += model_errors
+
+    # ---- [adapter] (omitted for full fine-tune) ----------------------------
+    adapter_cfg, adapter_errors = _build_adapter(network, model_dtype)
+    errors += adapter_errors
+
+    # ---- [optimizer] + top-level LR/loss/scheduler keys --------------------
+    optimizer_cfg, opt_errors = _build_optimizer(optimizer, main)
+    errors += opt_errors
+
+    # ---- general / training top-level --------------------------------------
+    main["epochs"] = _as_int(_first(general, "epochs", "max_train_epochs"), 1)
+    grad_acc = _as_int(_first(general, "gradient_accumulation_steps"), 1) or 1
+    main["gradient_accumulation_steps"] = grad_acc
+    main["micro_batch_size_per_gpu"] = _as_int(
+        _first(ds_general, "micro_batch_size_per_gpu", "batch_size"), 1
+    ) or 1
+    main["pipeline_stages"] = _as_int(_first(general, "pipeline_stages"), 1) or 1
+    main["activation_checkpointing"] = _as_bool(
+        _first(general, "activation_checkpointing", "gradient_checkpointing", default=True),
+        default=True,
+    )
+    if _as_bool(general.get("reentrant_activation_checkpointing")):
+        main["reentrant_activation_checkpointing"] = True
+    main["partition_method"] = _first(general, "partition_method", default="parameters")
+    blocks_to_swap = _as_int(general.get("blocks_to_swap"))
+    if blocks_to_swap:
+        main["blocks_to_swap"] = blocks_to_swap
+    if _as_bool(general.get("compile")):
+        main["compile"] = True
+    main["steps_per_print"] = _as_int(_first(general, "steps_per_print"), 1) or 1
+    main["caching_batch_size"] = _as_int(_first(general, "caching_batch_size"), 1) or 1
+    map_num_proc = _as_int(_first(general, "map_num_proc", "max_data_loader_n_workers"))
+    if map_num_proc:
+        main["map_num_proc"] = map_num_proc
+
+    # pipeline_stages must divide the GPU count sensibly.
+    if num_gpus % main["pipeline_stages"] != 0:
+        errors.append(
+            f"pipeline_stages ({main['pipeline_stages']}) must divide the GPU "
+            f"count ({num_gpus})."
+        )
+    if blocks_to_swap and main["pipeline_stages"] != 1:
+        errors.append("blocks_to_swap requires pipeline_stages = 1.")
+    if blocks_to_swap and adapter_cfg is None:
+        errors.append("blocks_to_swap requires an adapter (LoRA/LoKr), not full fine-tune.")
+
+    # ---- saving ------------------------------------------------------------
+    saving_errors = _build_saving(saving, general, mixed_precision, main)
+    errors += saving_errors
+
+    # ---- sampling cadence + sample.toml ------------------------------------
+    sample_cfg = _build_sample(sample, main)
+
+    # ---- [monitoring] ------------------------------------------------------
+    monitoring_cfg = _build_monitoring(logging_group, saving)
+
+    # ---- extra_args (free-form top-level injection) ------------------------
+    for key, value in extra.items():
+        if _blank(key):
             continue
-        if "fa" in value and value["fa"]:
-            output_args["network_module"] = "networks.lora_fa"
-            del value["fa"]
-        for arg, val in value.items():
-            if arg == "network_args":
-                vals = []
-                for k, v in val.items():
-                    if k == "algo":
-                        output_args["network_module"] = "lycoris.kohya"
-                    elif k == "unit":
-                        output_args["network_module"] = "networks.dylora"
-                    if k in [
-                        "down_lr_weight",
-                        "up_lr_weight",
-                        "block_dims",
-                        "block_alphas",
-                        "conv_block_dims",
-                        "conv_block_alphas",
-                    ]:
-                        for i in range(len(v)):
-                            v[i] = str(v[i])
-                        vals.append(f"{k}={','.join(v)}")
-                        continue
-                    if k == "preset" and v == "":
-                        continue
-                    vals.append(f"{k}={v}")
-                val = vals
-            if arg == "optimizer_args":
-                vals = []
-                for k, v in val.items():
-                    if isinstance(v, str) and v.strip().lower() in ["true", "false"]:
-                        v = v.strip().capitalize()
-                    vals.append(f"{k}={v}")
-                val = vals
-            if arg == "lr_scheduler_args":
-                vals = [f"{k}={v}" for k, v in val.items()]
-                val = vals
-            if arg == "keep_tokens_separator" and len(val) < 1:
-                passed_validation = False
-                errors.append("Keep Tokens Separator is an empty string")
-                continue
-            if (val is None or 
-                (isinstance(val, str) and val.strip() == '') or 
-                (isinstance(val, bool) and val == False)):
-                continue
-            if isinstance(val, str):
-                if val.strip().lower() == "true":
-                    val = True
-                elif val.strip().lower() == "false":
-                    continue
-            output_args[arg] = val
-        if "fa" in value:
-            del value["fa"]
-
-    # Anima mode is detected by the presence of the 'qwen3' key (Anima-only arg).
-    # In Anima mode, pretrained_model_name_or_path holds the DiT model path,
-    # and 'qwen3' / 'vae' hold the text encoder and VAE paths respectively.
-    is_anima = "qwen3" in output_args
-    file_inputs = [
-        {"name": "pretrained_model_name_or_path", "required": True},
-        {"name": "qwen3", "required": is_anima},
-        {"name": "vae", "required": is_anima},
-        {"name": "sample_prompts", "required": False},
-        {"name": "output_dir", "required": True},
-        {"name": "logging_dir", "required": False},
-        {"name": "t5_tokenizer_path", "required": False},
-    ]
-
-    for file in file_inputs:
-        if file["required"] and file["name"] not in output_args:
-            passed_validation = False
-            errors.append(f"{file['name']} is not found")
-            continue
-        
-        # Check if argument is present
-        if file["name"] in output_args:
-            path_obj = Path(output_args[file["name"]])
-            
-            # Special handling for creating directories
-            if file["name"] in ["output_dir", "logging_dir"]:
-                # If it doesn't exist, check if the parent/root is valid before creating
-                if not path_obj.exists():
-                    # Check if the parent path exists (or the path is relative and valid)
-                    if not path_obj.parent.exists():
-                        passed_validation = False
-                        errors.append(f"Parent path for {file['name']} '{path_obj.parent}' does not exist")
-                        continue
-                    
-                    try:
-                        path_obj.mkdir(parents=True, exist_ok=True)
-                    except OSError as e:
-                        passed_validation = False
-                        errors.append(f"Could not create directory for {file['name']}: {e}")
-                        continue
-
-            # Standard validation for other files/paths (must already exist)
-            elif not path_obj.exists():
-                passed_validation = False
-                errors.append(f"{file['name']} input '{output_args[file['name']]}' does not exist")
-                continue
-            
-            output_args[file["name"]] = path_obj.as_posix()
-    if "network_module" not in output_args:
-        if "guidance_scale" in output_args:
-            output_args["network_module"] = "networks.lora_flux"
+        if isinstance(value, str):
+            main[key] = _toml_literal(value)
         else:
-            output_args["network_module"] = "networks.lora"
-    config = Path("config.json")
-    config_dict = json.loads(config.read_text()) if config.is_file() else {}
-    if "colab" in config_dict and config_dict["colab"]:
-        output_args["console_log_simple"] = True
-    return passed_validation, errors, output_args
+            main[key] = value
+
+    # ---- dataset.toml ------------------------------------------------------
+    dataset_cfg, subsets_out, dataset_errors = _build_dataset(ds_general, bucket, subsets_in)
+    errors += dataset_errors
+
+    # ---- warmup_ratio -> warmup_steps (needs dataset + epochs) -------------
+    warmup_ratio = _as_float(optimizer.get("warmup_ratio"))
+    if warmup_ratio is not None and "warmup_steps" not in main:
+        steps = _calculate_steps(subsets_out, main["epochs"], grad_acc, num_gpus)
+        main["warmup_steps"] = round(steps * warmup_ratio)
+
+    # attach tables (process.py fills in dataset/sample paths)
+    main["model"] = model_cfg
+    if adapter_cfg is not None:
+        main["adapter"] = adapter_cfg
+    main["optimizer"] = optimizer_cfg
+    main["monitoring"] = monitoring_cfg
+
+    tags = _collect_tags(subsets_out)
+
+    passed = len(errors) == 0
+    return passed, errors, main, dataset_cfg, sample_cfg, tags
 
 
-def _validate_single_dataset(args: dict) -> tuple[bool, list[str], dict]:
-    passed_validation = True
-    errors = []
-    output_args = {"general": {}, "subsets": []}
-
-    for key, value in args.items():
-        if (value is None or
-                (isinstance(value, str) and value.strip() == '')):
-            passed_validation = False
-            errors.append(f"No Data filled in for {key}")
-            continue
-        if key == "subsets":
-            continue
-        for arg, val in value.items():
-            if (val is None or
-                (isinstance(val, str) and val.strip() == '') or
-                (isinstance(val, bool) and value == False)):
-                continue
-            if arg == "max_token_length" and val == 75:
-                continue
-            output_args["general"][arg] = val
-
-    for item in args.get("subsets", []):
-        sub_res = validate_subset(item)
-        if not sub_res[0]:
-            passed_validation = False
-            errors += sub_res[1]
-            continue
-        output_args["subsets"].append(sub_res[2])
-    return passed_validation, errors, output_args
+# --------------------------------------------------------------------------- #
+# Section builders
+# --------------------------------------------------------------------------- #
+def _validate_path(value, label, errors, must_be_file=False):
+    path = Path(value)
+    if not path.exists():
+        errors.append(f"{label} '{value}' does not exist")
+        return None
+    if must_be_file and not path.is_file():
+        errors.append(f"{label} '{value}' is not a file")
+        return None
+    return path.as_posix()
 
 
-def validate_dataset_args(args: dict) -> tuple[bool, list[str], dict]:
-    # Multi-dataset (multi-resolution) shape: {"datasets": [{"general": {...}, "subsets": [...]}, ...]}
-    if "datasets" in args:
-        passed_validation = True
-        errors = []
-        output_args = {"datasets": []}
-        for i, dataset in enumerate(args["datasets"]):
-            ds_pass, ds_errors, ds_out = _validate_single_dataset(dataset)
-            if not ds_pass:
-                passed_validation = False
-                errors += [f"[dataset {i}] {e}" for e in ds_errors]
-            output_args["datasets"].append(ds_out)
-        return passed_validation, errors, output_args
+def _build_model(group: dict, model_dtype: str):
+    errors: list[str] = []
+    cfg: dict = {"type": "anima"}
 
-    # Legacy single-dataset shape: {"general": {...}, "subsets": [...]}
-    return _validate_single_dataset(args)
+    transformer = _first(group, "transformer_path", "pretrained_model_name_or_path")
+    llm = _first(group, "llm_path", "qwen3")
+    vae = _first(group, "vae_path", "vae")
 
-
-def validate_subset(args: dict) -> tuple[bool, list[str], dict]:
-    passed_validation = True
-    errors = []
-    output_args = {
-        key: value for key, value in args.items() if not 
-        (value is None or 
-         (isinstance(value, str) and value.strip() == '') or 
-         (isinstance(value, bool) and value == False))
-         }
-    name = "subset"
-    if "name" in output_args:
-        name = output_args["name"]
-        del output_args["name"]
-    if "image_dir" not in output_args or not Path(output_args["image_dir"]).exists():
-        passed_validation = False
-        errors.append(f"Image directory path for '{name}' does not exist")
+    if _blank(transformer):
+        errors.append("transformer_path (base model) is required")
     else:
-        output_args["image_dir"] = Path(output_args["image_dir"]).as_posix()
-        
-    if "target_image_dir" in output_args and Path(output_args["target_image_dir"]).exists():
-        output_args["target_image_dir"] = Path(output_args["target_image_dir"]).as_posix()
-
-    return passed_validation, errors, output_args
-
-
-def validate_restarts(args: dict, dataset: dict, num_processes: int = 1) -> None:
-    if "lr_scheduler_num_cycles" not in args:
-        return
-    if "lr_scheduler_type" not in args:
-        return
-    if "max_train_steps" in args:
-        steps = args["max_train_steps"]
+        resolved = _validate_path(transformer, "transformer_path", errors, must_be_file=True)
+        if resolved:
+            cfg["transformer_path"] = resolved
+    if _blank(llm):
+        errors.append("llm_path (Qwen3 text encoder) is required")
     else:
-        steps = calculate_steps(
-            dataset,
-            args["max_train_epochs"],
-            args.get("gradient_accumulation_steps", 1),
-            num_processes,
-        )
-    steps = steps // args["lr_scheduler_num_cycles"]
-    args["lr_scheduler_args"].append(f"first_cycle_max_steps={steps}")
-    #del args["lr_scheduler_num_cycles"]
-
-
-def validate_warmup_ratio(args: dict, dataset: dict, num_processes: int = 1) -> None:
-    if "warmup_ratio" not in args:
-        return
-    if "max_train_steps" in args:
-        steps = args["max_train_steps"]
+        # llm_path may be a file (Qwen3 safetensors) or a directory (generic LLM).
+        resolved = _validate_path(llm, "llm_path", errors)
+        if resolved:
+            cfg["llm_path"] = resolved
+    if _blank(vae):
+        errors.append("vae_path is required")
     else:
-        steps = calculate_steps(
-            dataset,
-            args["max_train_epochs"],
-            args.get("gradient_accumulation_steps", 1),
-            num_processes,
-        )
-    steps = round(steps * args["warmup_ratio"])
-    if "lr_scheduler_type" in args:
-        args["lr_scheduler_args"].append(f"warmup_steps={steps // args.get('lr_scheduler_num_cycles', 1)}")
-    else:
-        args["lr_warmup_steps"] = steps
-    del args["warmup_ratio"]
+        resolved = _validate_path(vae, "vae_path", errors, must_be_file=True)
+        if resolved:
+            cfg["vae_path"] = resolved
 
+    cfg["dtype"] = model_dtype
+    transformer_dtype = _first(group, "transformer_dtype")
+    if transformer_dtype:
+        cfg["transformer_dtype"] = DTYPE_MAP.get(str(transformer_dtype).lower(), model_dtype)
 
-def validate_existing_files(args: dict) -> None:
-    file_name = Path(f"{args['output_dir']}/{args.get('output_name', 'last')}.safetensors")
-    offset = 1
-    while file_name.exists():
-        file_name = Path(f"{args['output_dir']}/{args.get('output_name', 'last')}_{offset}.safetensors")
-        offset += 1
-    if offset > 1:
-        print(f"Duplicate file found, changing file name to {file_name.stem}")
-        args["output_name"] = file_name.stem
-
-
-def validate_sdxl(args: dict) -> bool:
-    if "sdxl" not in args:
-        return False
-    del args["sdxl"]
-    return True
-
-
-def validate_save_tags(dataset: dict) -> dict:
-    tags = {}
-    if "datasets" in dataset:
-        all_subsets = [s for ds in dataset["datasets"] for s in ds.get("subsets", [])]
-    else:
-        all_subsets = dataset.get("subsets", [])
-
-    # Dedupe by (image_dir, caption_extension): multi-res configs repeat the
-    # same subset across resolutions and we don't want to count tags N times.
-    seen: set[tuple[str, str]] = set()
-    for subset in all_subsets:
-        if 'is_val' in subset and subset['is_val']:
-            continue
-        key = (subset.get("image_dir", ""), subset.get("caption_extension", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        subset_dir = Path(subset["image_dir"])
-        if not subset_dir.is_dir():
-            continue
-        for file in subset_dir.iterdir():
-            if not file.is_file():
-                continue
-            if file.suffix != subset["caption_extension"]:
-                continue
-            get_tags_from_file(subset_dir.joinpath(file.name), tags)
-    return dict(sorted(tags.items(), key=lambda item: item[1], reverse=True))
-
-
-def validate_optimizer(args: dict) -> None:
-    opt_type_lower = args["optimizer_type"].lower()
-
-    if opt_type_lower in OPTIMIZERS:
-        args["optimizer_type"] = f"{OPTIMIZERS[opt_type_lower].__module__}.{OPTIMIZERS[opt_type_lower].__qualname__}"
-        return
-    
-
-
-def get_tags_from_file(file: str, tags: dict) -> None:
-    with open(file, "r", encoding="utf-8") as f:
-        temp = f.read().replace(", ", ",").split(",")
-        for tag in temp:
-            if tag in tags:
-                tags[tag] += 1
-            else:
-                tags[tag] = 1
-
-
-def _calculate_steps_single(
-    general_args: dict,
-    subsets: list,
-    grad_acc_steps: int,
-    num_processes: int,
-) -> int:
-    supported_types = [".png", ".jpg", ".jpeg", ".webp", ".bmp"]
-    resolution = (
-        (general_args["resolution"], general_args["resolution"])
-        if isinstance(general_args["resolution"], int)
-        else general_args["resolution"]
-    )
-    if general_args.get("enable_bucket", False):
-        bucketManager = BucketManager(
-            general_args.get("bucket_no_upscale", False),
-            resolution,
-            general_args["min_bucket_reso"],
-            general_args["max_bucket_reso"],
-            general_args["bucket_reso_steps"],
-            general_args.get("multires_training", False),
-        )
-        if not general_args.get("bucket_no_upscale", False):
-            bucketManager.make_buckets()
-    else:
-        bucketManager = BucketManager(False, resolution, None, None, None, False)
-        bucketManager.set_predefined_resos([resolution])
-
-    # sd-scripts excludes images whose larger side is <= skip_image_resolution
-    # when the dataset is part of a multi-resolution training group.
-    skip_reso = general_args.get("skip_image_resolution", 0) or 0
-    for subset in subsets:
-        if 'is_val' in subset and subset['is_val']:
-            continue
-        for image in Path(subset["image_dir"]).iterdir():
-            if image.suffix not in supported_types:
-                continue
-            with Image.open(image) as img:
-                if skip_reso and max(img.width, img.height) <= skip_reso:
-                    continue
-                bucket_reso, _, _ = bucketManager.select_bucket(img.width, img.height)
-                for _ in range(subset["num_repeats"]):
-                    bucketManager.add_image(bucket_reso, image)
-    return sum(
-        math.ceil(len(bucket) / general_args["batch_size"]) for bucket in bucketManager.buckets
-    )
-
-
-def calculate_steps(
-    dataset_args: dict[str, dict | list[dict]],
-    num_epochs: int,
-    grad_acc_steps: int = 1,
-    num_processes: int = 1,
-) -> int:
-    if "datasets" in dataset_args:
-        steps_before_acc = sum(
-            _calculate_steps_single(
-                ds.get("general", {}), ds.get("subsets", []), grad_acc_steps, num_processes
+    method = _first(group, "timestep_sample_method", "timestep_sampling")
+    if method:
+        method = str(method).lower()
+        if method not in VALID_TIMESTEP_METHODS:
+            errors.append(
+                f"timestep_sample_method '{method}' is not supported by Anima "
+                f"(use one of {sorted(VALID_TIMESTEP_METHODS)})"
             )
-            for ds in dataset_args["datasets"]
-        )
+        else:
+            cfg["timestep_sample_method"] = method
+
+    sigmoid_scale = _as_float(group.get("sigmoid_scale"))
+    if sigmoid_scale is not None:
+        cfg["sigmoid_scale"] = sigmoid_scale
+
+    # llm_adapter_lr defaults to 0 (freeze the Qwen3->DiT adapter) unless the
+    # user explicitly opts in.
+    if not _blank(group.get("llm_adapter_lr")):
+        cfg["llm_adapter_lr"] = _as_float(group.get("llm_adapter_lr"), 0.0)
     else:
-        steps_before_acc = _calculate_steps_single(
-            dataset_args["general"], dataset_args["subsets"], grad_acc_steps, num_processes
+        cfg["llm_adapter_lr"] = 0
+
+    shift = _as_float(group.get("shift"))
+    if shift is not None:
+        cfg["shift"] = shift
+    elif _as_bool(group.get("flux_shift")):
+        cfg["flux_shift"] = True
+
+    multiscale = _as_float(group.get("multiscale_loss_weight"))
+    if multiscale is not None:
+        cfg["multiscale_loss_weight"] = multiscale
+    contrastive = _as_float(group.get("contrastive_flow_lambda"))
+    if contrastive:
+        cfg["contrastive_flow_lambda"] = contrastive
+    if group.get("cache_text_embeddings") is not None:
+        cfg["cache_text_embeddings"] = _as_bool(group.get("cache_text_embeddings"), True)
+
+    for lr_key in ("self_attn_lr", "cross_attn_lr", "mlp_lr", "mod_lr"):
+        if not _blank(group.get(lr_key)):
+            cfg[lr_key] = _as_float(group.get(lr_key))
+
+    return cfg, errors
+
+
+def _build_adapter(group: dict, model_dtype: str):
+    """Return (adapter_cfg or None, errors). ``None`` means full fine-tune."""
+    errors: list[str] = []
+    adapter_type = _first(group, "type", "algo")
+    if _blank(adapter_type):
+        return None, errors
+    adapter_type = str(adapter_type).lower()
+    if adapter_type in ("none", "full", "fft", "full_finetune", "full fine-tune"):
+        return None, errors
+    if adapter_type not in ADAPTER_TYPES:
+        errors.append(
+            f"adapter type '{adapter_type}' is not supported by diffusion-pipe "
+            f"(use 'lora', 'lokr', or 'none' for full fine-tune)"
         )
-    return math.ceil(steps_before_acc / grad_acc_steps / num_processes) * num_epochs
+        return None, errors
+
+    cfg: dict = {"type": adapter_type}
+    if not _blank(group.get("alpha")) or not _blank(group.get("network_alpha")):
+        errors.append(
+            "network_alpha is not supported: diffusion-pipe forces alpha = rank. "
+            "Remove it from the config."
+        )
+    cfg["rank"] = _as_int(_first(group, "rank", "network_dim"), 32) or 32
+    dropout = _as_float(_first(group, "dropout", "network_dropout"))
+    if dropout:
+        cfg["dropout"] = dropout
+    cfg["dtype"] = DTYPE_MAP.get(str(_first(group, "dtype", default=model_dtype)).lower(), model_dtype)
+
+    if adapter_type == "lokr":
+        factor = _as_int(group.get("factor"))
+        cfg["factor"] = factor if factor is not None else -1
+        for flag in ("use_tucker", "decompose_both", "rank_dropout_scale", "include_conv"):
+            if _as_bool(group.get(flag)):
+                cfg[flag] = True
+        for num_key in ("rank_dropout", "module_dropout"):
+            val = _as_float(group.get(num_key))
+            if val:
+                cfg[num_key] = val
+
+    init_from = _first(group, "init_from_existing", "network_weights")
+    if init_from:
+        # Path may be an adapter run dir; existence is best-effort here.
+        cfg["init_from_existing"] = Path(init_from).as_posix()
+
+    return cfg, errors
+
+
+def _build_optimizer(group: dict, main: dict):
+    errors: list[str] = []
+    cfg: dict = {}
+
+    opt_type = _first(group, "optimizer_type", "type", default="adamw_optimi")
+    cfg["type"] = OPTIMIZER_NAME_MAP.get(str(opt_type).lower(), opt_type)
+
+    lr = _as_float(_first(group, "lr", "learning_rate", "unet_lr"))
+    if lr is None:
+        errors.append("learning_rate is required")
+    else:
+        cfg["lr"] = lr
+
+    # Inlined optimizer sub-args (betas, weight_decay, eps, ...).
+    sub = group.get("optimizer_args", {}) or {}
+    if isinstance(sub, dict):
+        for key, value in sub.items():
+            if _blank(value):
+                continue
+            cfg[key] = value
+
+    # top-level training keys derived from the optimizer group
+    max_grad_norm = _as_float(_first(group, "max_grad_norm", "gradient_clipping"))
+    if max_grad_norm is not None:
+        main["gradient_clipping"] = max_grad_norm
+
+    warmup_steps = _as_int(_first(group, "warmup_steps", "lr_warmup_steps"))
+    if warmup_steps is not None:
+        main["warmup_steps"] = warmup_steps
+
+    scheduler = _first(group, "lr_scheduler")
+    if scheduler:
+        scheduler = str(scheduler).lower()
+        if scheduler in VALID_LR_SCHEDULERS and scheduler != "constant":
+            main["lr_scheduler"] = scheduler
+        elif scheduler not in VALID_LR_SCHEDULERS:
+            errors.append(
+                f"lr_scheduler '{scheduler}' is not supported "
+                f"(use one of {sorted(VALID_LR_SCHEDULERS)})"
+            )
+
+    force_constant = _as_float(group.get("force_constant_lr"))
+    if force_constant is not None:
+        main["force_constant_lr"] = force_constant
+
+    # Huber / smooth-L1 loss (Anima reads these top-level keys).
+    loss_type = str(_first(group, "loss_type", default="")).lower()
+    if loss_type in ("huber", "smooth_l1"):
+        c = _as_float(_first(group, "huber_c", "huber_delta", "smooth_l1_beta"))
+        if c is not None:
+            main["huber_delta" if loss_type == "huber" else "smooth_l1_beta"] = c
+
+    return cfg, errors
+
+
+def _build_saving(saving: dict, general: dict, mixed_precision, main: dict):
+    errors: list[str] = []
+
+    output_dir = _first(saving, "output_dir")
+    if _blank(output_dir):
+        errors.append("output_dir is required")
+    else:
+        path = Path(output_dir)
+        if not path.exists():
+            if not path.parent.exists():
+                errors.append(f"Parent path for output_dir '{path.parent}' does not exist")
+            else:
+                try:
+                    path.mkdir(parents=True, exist_ok=True)
+                    main["output_dir"] = path.as_posix()
+                except OSError as exc:
+                    errors.append(f"Could not create output_dir: {exc}")
+        else:
+            main["output_dir"] = path.as_posix()
+
+    main["output_name"] = _first(saving, "output_name", default="model")
+
+    save_epochs = _as_int(saving.get("save_every_n_epochs"))
+    save_steps = _as_int(saving.get("save_every_n_steps"))
+    save_examples = _as_int(saving.get("save_every_n_examples"))
+    if save_epochs:
+        main["save_every_n_epochs"] = save_epochs
+    if save_steps:
+        main["save_every_n_steps"] = save_steps
+    if save_examples:
+        main["save_every_n_examples"] = save_examples
+    if not (save_epochs or save_steps or save_examples):
+        # diffusion-pipe asserts at least one; default to every epoch.
+        main["save_every_n_epochs"] = 1
+
+    save_precision = _first(saving, "save_precision", default=mixed_precision)
+    main["save_dtype"] = DTYPE_MAP.get(str(save_precision).lower(), "bfloat16")
+
+    ckpt_epochs = _as_int(saving.get("checkpoint_every_n_epochs"))
+    ckpt_minutes = _as_int(saving.get("checkpoint_every_n_minutes"))
+    if ckpt_epochs:
+        main["checkpoint_every_n_epochs"] = ckpt_epochs
+    elif ckpt_minutes:
+        main["checkpoint_every_n_minutes"] = ckpt_minutes
+
+    return errors
+
+
+def _build_sample(sample: dict, main: dict):
+    sample_epochs = _as_int(sample.get("sample_every_n_epochs"))
+    sample_steps = _as_int(sample.get("sample_every_n_steps"))
+    if sample_epochs:
+        main["sample_every_n_epochs"] = sample_epochs
+    if sample_steps:
+        main["sample_every_n_steps"] = sample_steps
+    if _as_bool(sample.get("sample_at_first")):
+        main["sample_at_first"] = True
+
+    prompts_in = sample.get("prompts", []) or []
+    prompts: list[dict] = []
+    for entry in prompts_in:
+        if isinstance(entry, str):
+            text = entry.strip()
+            if text:
+                prompts.append({"prompt": text})
+            continue
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get("prompt", "")
+        if _blank(text):
+            continue
+        prompt = {"prompt": text}
+        neg = entry.get("negative_prompt")
+        if not _blank(neg):
+            prompt["negative_prompt"] = neg
+        prompts.append(prompt)
+
+    if not prompts:
+        # No prompts -> no sampling; drop cadence keys to avoid a dangling ref.
+        main.pop("sample_every_n_epochs", None)
+        main.pop("sample_every_n_steps", None)
+        main.pop("sample_at_first", None)
+        return None
+
+    cfg = {
+        "width": _as_int(sample.get("width"), 1024) or 1024,
+        "height": _as_int(sample.get("height"), 1024) or 1024,
+        "num_inference_steps": _as_int(_first(sample, "num_inference_steps", "steps"), 32) or 32,
+        "guidance_scale": _as_float(_first(sample, "guidance_scale", "cfg"), 4.0),
+        "seed": _as_int(sample.get("seed"), 42),
+        "prompts": prompts,
+    }
+    return cfg
+
+
+def _build_monitoring(logging_group: dict, saving: dict):
+    cfg = {"enable_wandb": _as_bool(logging_group.get("enable_wandb"))}
+    if cfg["enable_wandb"]:
+        cfg["wandb_api_key"] = _first(logging_group, "wandb_api_key", default="")
+        cfg["wandb_tracker_name"] = _first(logging_group, "wandb_tracker_name", default="")
+        run_name = _first(logging_group, "wandb_run_name")
+        if _blank(run_name):
+            run_name = _first(saving, "output_name")
+        if run_name:
+            cfg["wandb_run_name"] = run_name
+    return cfg
+
+
+def _build_dataset(general: dict, bucket: dict, subsets_in: list):
+    errors: list[str] = []
+    cfg: dict = {}
+
+    resolutions = general.get("resolutions", general.get("resolution"))
+    cfg["resolutions"] = _normalize_resolutions(resolutions)
+
+    cfg["enable_ar_bucket"] = _as_bool(bucket.get("enable_ar_bucket", bucket.get("enable_bucket", True)), True)
+    cfg["min_ar"] = _as_float(bucket.get("min_ar"), 0.5)
+    cfg["max_ar"] = _as_float(bucket.get("max_ar"), 2.0)
+    cfg["num_ar_buckets"] = _as_int(bucket.get("num_ar_buckets"), 7) or 7
+    cfg["frame_buckets"] = [1]
+
+    # Global caption knobs.
+    shuffle_num = _as_int(general.get("cache_shuffle_num"))
+    if shuffle_num is None and _as_bool(general.get("shuffle_caption")):
+        shuffle_num = 10  # sensible default number of pre-shuffled variants
+    if shuffle_num:
+        cfg["cache_shuffle_num"] = shuffle_num
+        delimiter = _first(general, "cache_shuffle_delimiter")
+        if delimiter:
+            cfg["cache_shuffle_delimiter"] = delimiter
+    keep_tokens = _as_int(general.get("keep_tokens"))
+    if keep_tokens:
+        cfg["keep_tokens"] = keep_tokens
+    keep_sep = _first(general, "keep_tokens_separator")
+    if keep_sep:
+        cfg["keep_tokens_separator"] = keep_sep
+    if _as_bool(general.get("enable_random_caption")):
+        cfg["enable_random_caption"] = True
+    if general.get("skip_empty_caption") is not None:
+        cfg["skip_empty_caption"] = _as_bool(general.get("skip_empty_caption"), True)
+    if _as_bool(general.get("online_captions")):
+        cfg["online_captions"] = True
+
+    directories: list[dict] = []
+    if not subsets_in:
+        errors.append("At least one dataset directory (subset) is required")
+    for index, subset in enumerate(subsets_in):
+        path_value = _first(subset, "path", "image_dir")
+        if _blank(path_value):
+            errors.append(f"[subset {index}] image directory path is required")
+            continue
+        path = Path(path_value)
+        if not path.is_dir():
+            errors.append(f"[subset {index}] image directory '{path_value}' does not exist")
+            continue
+        entry = {"path": path.as_posix(), "num_repeats": _as_int(subset.get("num_repeats"), 1) or 1}
+        mask = _first(subset, "mask_path")
+        if mask:
+            mask_path = Path(mask)
+            if not mask_path.is_dir():
+                errors.append(f"[subset {index}] mask_path '{mask}' does not exist")
+            else:
+                entry["mask_path"] = mask_path.as_posix()
+        directories.append(entry)
+
+    cfg["directory"] = directories
+    return cfg, directories, errors
+
+
+def _normalize_resolutions(value):
+    if value is None:
+        return [1024]
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                out.append([int(item[0]), int(item[1])])
+            elif not _blank(item):
+                out.append(int(item))
+        return out or [1024]
+    try:
+        return [int(value)]
+    except (TypeError, ValueError):
+        return [1024]
+
+
+# --------------------------------------------------------------------------- #
+# Step counting (for warmup_ratio) + tag counting
+# --------------------------------------------------------------------------- #
+def _count_images(subsets: list) -> int:
+    total = 0
+    for subset in subsets:
+        directory = Path(subset["path"])
+        if not directory.is_dir():
+            continue
+        count = sum(
+            1 for f in directory.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+        )
+        total += count * subset.get("num_repeats", 1)
+    return total
+
+
+def _calculate_steps(subsets: list, epochs: int, grad_acc: int, num_gpus: int) -> int:
+    images = _count_images(subsets)
+    if images == 0:
+        return 0
+    per_epoch = math.ceil(images / max(grad_acc, 1) / max(num_gpus, 1))
+    return per_epoch * max(epochs, 1)
+
+
+def _collect_tags(subsets: list) -> dict:
+    tags: dict[str, int] = {}
+    seen: set[str] = set()
+    for subset in subsets:
+        directory = Path(subset["path"])
+        if directory.as_posix() in seen or not directory.is_dir():
+            continue
+        seen.add(directory.as_posix())
+        for caption_file in directory.glob("*.txt"):
+            _read_tags(caption_file, tags)
+    return dict(sorted(tags.items(), key=lambda kv: kv[1], reverse=True))
+
+
+def _read_tags(path: Path, tags: dict) -> None:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for tag in content.replace(", ", ",").split(","):
+        tag = tag.strip()
+        if not tag:
+            continue
+        tags[tag] = tags.get(tag, 0) + 1

@@ -2,3 +2,6 @@
 	path = sd_scripts
 	url = https://github.com/nawka12/sd-scripts
 	branch = sd3-upstream
+[submodule "diffusion_pipe"]
+	path = diffusion_pipe
+	url = https://github.com/Raelina-Rae/diffusion-pipe

@@ -6,9 +6,10 @@ from starlette.routing import Route
 from starlette import status
 import json
 from utils.validation import validate
-from utils.process import process_args, process_dataset_args
+from utils.process import write_configs
 from pathlib import Path
 import subprocess
+import signal
 from utils.tunnel_service import CloudflaredTunnel, create_tunnel
 import uvicorn
 import os
@@ -99,15 +100,17 @@ async def validate_inputs(request: Request) -> JSONResponse:
         )
     body = await request.body()
     body = json.loads(body)
-    passed_validation, sdxl, errors, args, dataset_args, tags = validate(body)
-    if passed_validation:
-        output_args, _ = process_args(args)
-        output_dataset_args, _ = process_dataset_args(dataset_args)
-        final_args = {"args": output_args, "dataset": output_dataset_args, "tags": tags}
-        return JSONResponse(final_args)
+    passed, errors, main_cfg, dataset_cfg, sample_cfg, tags = validate(body)
+    if not passed:
+        return JSONResponse(errors, status_code=status.HTTP_400_BAD_REQUEST)
+    main_path, dataset_path, sample_path = write_configs(main_cfg, dataset_cfg, sample_cfg)
     return JSONResponse(
-        errors,
-        status_code=status.HTTP_400_BAD_REQUEST,
+        {
+            "tags": tags,
+            "main": main_path.read_text(encoding="utf-8"),
+            "dataset": dataset_path.read_text(encoding="utf-8"),
+            "sample": sample_path.read_text(encoding="utf-8") if sample_path else "",
+        }
     )
 
 
@@ -148,75 +151,44 @@ async def start_training(request: Request) -> JSONResponse:
             {"detail": "Training Already Running"},
             status_code=status.HTTP_409_CONFLICT,
         )
-    is_sdxl = request.query_params.get("sdxl", "False") == "True"
-    train_type = request.query_params.get("train_mode", "lora")
-    is_flux = request.query_params.get("flux", "False") == "True"
-    is_anima = request.query_params.get("anima", "False") == "True"
 
-    # Parse accelerate (multi-GPU) settings
+    # GPU count + master port come from the (formerly "accelerate") settings.
+    # Legacy sdxl/flux/anima/train_mode params are accepted and ignored.
     accelerate_enabled = request.query_params.get("accelerate_enabled", "False") == "True"
-    accelerate_num_processes = int(request.query_params.get("accelerate_num_processes", "2"))
-    accelerate_main_process_port = int(request.query_params.get("accelerate_main_process_port", "29500"))
-    match [train_type, is_sdxl, is_flux, is_anima]:
-        case ["lora", False, False, False]:
-            app.state.TRAIN_SCRIPT = "train_network.py"
-        case ["lora", True, False, False]:
-            app.state.TRAIN_SCRIPT = "sdxl_train_network.py"
-        case ["lora", False, True, False]:
-            app.state.TRAIN_SCRIPT = "flux_train_network.py"
-        case ["lora", False, False, True]:
-            app.state.TRAIN_SCRIPT = "anima_train_network.py"
-        case ["textual_inversion", False, False, False]:
-            app.state.TRAIN_SCRIPT = "train_textual_inversion.py"
-        case ["textual_inversion", True, False, False]:
-            app.state.TRAIN_SCRIPT = "sdxl_train_textual_inversion.py"
-        case _:
-            print("Unknown training request: {request.query_params}")
-            return JSONResponse(
-                {
-                    "detail": "Invalid Train Parameters",
-                    "sdxl": is_sdxl,
-                    "train_type": train_type,
-                    "flux": is_flux,
-                    "anima": is_anima,
-                },
-                status_code=status.HTTP_400_BAD_REQUEST,
-            )
+    num_gpus = (
+        int(request.query_params.get("accelerate_num_processes", "1"))
+        if accelerate_enabled
+        else 1
+    )
+    master_port = int(request.query_params.get("accelerate_main_process_port", "29500"))
+    resume = request.query_params.get("resume", "False").lower() in ("true", "1")
 
     server_config_dict = json.loads(app.state.CONFIG.read_text()) if app.state.CONFIG else {}
-    python = sys.executable
-    config = Path("runtime_store/config.toml")
-    dataset = Path("runtime_store/dataset.toml")
-    if not config.is_file() or not dataset.is_file():
+    main_config = Path("runtime_store/main.toml")
+    if not main_config.is_file():
         return JSONResponse(
             {"detail": "No Previously Validated Args"},
             status_code=status.HTTP_400_BAD_REQUEST,
         )
-    print(app.state.TRAIN_SCRIPT)
 
-    # Build command based on accelerate settings
-    if accelerate_enabled:
-        # Multi-GPU training with accelerate launch
-        cmd = [
-            python,
-            "-m", "accelerate.commands.launch",
-            f"--num_processes={accelerate_num_processes}",
-            f"--main_process_port={accelerate_main_process_port}",
-            str(Path(f"sd_scripts/{app.state.TRAIN_SCRIPT}").resolve()),
-            f"--config_file={config.resolve()}",
-            f"--dataset_config={dataset.resolve()}",
-        ]
-        print(f"Launching with accelerate: {accelerate_num_processes} processes")
-    else:
-        # Single GPU training (original behavior)
-        cmd = [
-            python,
-            str(Path(f"sd_scripts/{app.state.TRAIN_SCRIPT}").resolve()),
-            f"--config_file={config.resolve()}",
-            f"--dataset_config={dataset.resolve()}",
-        ]
+    train_script = Path("diffusion_pipe/train.py").resolve()
+    cmd = [
+        "deepspeed",
+        f"--num_gpus={num_gpus}",
+        f"--master_port={master_port}",
+        str(train_script),
+        "--config",
+        str(main_config.resolve()),
+    ]
+    if resume:
+        cmd.append("--resume_from_checkpoint")
+    print(f"Launching diffusion-pipe: {' '.join(cmd)}")
 
-    app.state.TRAINING_THREAD = subprocess.Popen(cmd)
+    env = {**os.environ, "NCCL_P2P_DISABLE": "1", "NCCL_IB_DISABLE": "1"}
+    # deepspeed forks worker processes; start them in a fresh process group so
+    # stop_training can signal the whole group (terminate() on the launcher
+    # alone orphans the workers, which keep the GPU memory pinned).
+    app.state.TRAINING_THREAD = subprocess.Popen(cmd, env=env, preexec_fn=os.setsid)
     if (
         "kill_tunnel_on_train_start" in server_config_dict
         and server_config_dict["kill_tunnel_on_train_start"]
@@ -230,18 +202,22 @@ async def start_training(request: Request) -> JSONResponse:
 
 
 async def stop_training(request: Request) -> JSONResponse:
-    force = bool(request.query_params.get("force", False))
-    if not app.state.TRAINING_THREAD and app.state.TRAINING_THREAD.poll() is not None:
+    force = request.query_params.get("force", "False").lower() in ("true", "1")
+    thread = app.state.TRAINING_THREAD
+    if not thread or thread.poll() is not None:
         return JSONResponse(
             {"detail": "Not Currently Training"},
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    # Signal the whole process group so deepspeed's forked workers die too and
+    # release the GPU. Fall back to the launcher pid if the group is already gone.
+    try:
+        os.killpg(os.getpgid(thread.pid), sig)
+    except ProcessLookupError:
+        thread.send_signal(sig)
     if force:
-        app.state.TRAINING_THREAD.stderr = None
-        app.state.TRAINING_THREAD.kill()
         return JSONResponse({"detail": "Training Thread Killed"})
-    else:
-        app.state.TRAINING_THREAD.terminate()
     return JSONResponse({"detail": "Training Thread Requested to Die"})
 
 
@@ -278,7 +254,6 @@ routes = [
 ]
 
 app = Starlette(debug=True, routes=routes)
-app.state.TRAIN_SCRIPT = None
 app.state.TRAINING_THREAD = None
 app.state.CONFIG = Path("config.json")
 app.state.MONITOR_THREAD = None

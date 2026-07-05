@@ -96,9 +96,15 @@ def _install_flash_attn(uv: str, venv_path: str = "venv") -> None:
 
 
 def setup_venv(uv: str, venv_path: str = "venv"):
-    """Install all backend + sd_scripts packages into the venv using uv."""
+    """Install diffusion-pipe + backend + frontend packages into the venv.
+
+    NOTE: the torch / flash-attn / CUDA pins below need validation on real GPU
+    hardware during the Phase 0 smoke test (BACK-MIGRATE.md §5). They are kept
+    consistent with the flash-attn wheels declared above (torch 2.7 / cu128).
+    """
     uv_pip_install(uv, "-U", "typing-extensions==4.15.0", venv_path=venv_path)
 
+    # torch must be installed before deepspeed (which builds against it).
     uv_pip_install(
         uv,
         "-U", "torch~=2.7.1", "torchvision~=0.22.1", "numpy~=2.2.6",
@@ -106,48 +112,16 @@ def setup_venv(uv: str, venv_path: str = "venv"):
         venv_path=venv_path,
     )
 
-    uv_pip_install(
-        uv,
-        "-U", "--force-reinstall", "--no-deps",
-        "git+https://github.com/67372a/RamTorch",
-        venv_path=venv_path,
-    )
-
-    uv_pip_install(
-        uv,
-        "-U", "--force-reinstall", "--no-deps",
-        "git+https://github.com/67372a/customized-optimizers",
-        venv_path=venv_path,
-    )
-
-    uv_pip_install(
-        uv,
-        "-U", "--no-deps", "xformers==0.0.31.post1",
-        "--index-url", "https://download.pytorch.org/whl/cu128",
-        venv_path=venv_path,
-    )
-
-    uv_pip_install(
-        uv,
-        "-U", "--no-deps", "torchao~=0.13.0",
-        "--index-strategy", "unsafe-best-match",
-        "--extra-index-url", "https://download.pytorch.org/whl/cu128",
-        venv_path=venv_path,
-    )
-
-    uv_pip_install(
-        uv,
-        "-U", "--force-reinstall", "--no-deps",
-        "git+https://github.com/67372a/LyCORIS@dev",
-        venv_path=venv_path,
-    )
-
     # Pre-install flash-attn explicitly to avoid uv version normalization issues
     # (uv normalizes FALSE -> false in local version identifiers, causing reinstall loops)
     _install_flash_attn(uv, venv_path)
 
+    # diffusion-pipe's own requirements (includes deepspeed, transformers,
+    # diffusers, peft, torch-optimi, pytorch-optimizer, wandb, tensorboard, ...).
+    uv_pip_install(uv, "-r", "diffusion_pipe/requirements.txt", venv_path=venv_path)
+    # Starlette / uvicorn / tunnel deps for the HTTP server itself.
     uv_pip_install(uv, "-r", "requirements.txt", venv_path=venv_path)
-    uv_pip_install(uv, "-e", "../custom_scheduler/.", venv_path=venv_path)
+    # Frontend-side deps shared with the backend process.
     uv_pip_install(uv, "-r", "../requirements.txt", venv_path=venv_path)
 
 
@@ -205,17 +179,21 @@ def main():
     if not check_git_install():
         quit()
 
-    subprocess.check_call("git submodule update --init --recursive", shell=PLATFORM == "linux")
+    # Only the diffusion_pipe submodule is needed for Anima training; its own
+    # heavy sub-submodules (ComfyUI, HunyuanVideo, Cosmos, ...) are for other
+    # model families and are intentionally NOT pulled.
+    subprocess.check_call(
+        "git submodule update --init diffusion_pipe", shell=PLATFORM == "linux"
+    )
 
     setup_config(
         len(sys.argv) > 1 and sys.argv[1] == "colab",
         len(sys.argv) > 1 and sys.argv[1] == "local",
     )
 
-    os.chdir("sd_scripts")
-
     logger.info("creating venv and installing requirements")
     uv = ensure_uv()
+    # Backend-level venv (shared by the HTTP server and the deepspeed trainer).
     venv_path = create_venv(uv, "venv", "3.11")
 
     if len(sys.argv) > 1 and sys.argv[1] == "colab":
@@ -224,7 +202,6 @@ def main():
         quit()
 
     setup_venv(uv, venv_path)
-    setup_accelerate(PLATFORM)
 
     logger.info("Completed installing, you can run the server via the run.bat or run.sh files")
 
