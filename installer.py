@@ -180,11 +180,18 @@ def main():
     if not check_git_install():
         quit()
 
-    # Only the diffusion_pipe submodule is needed for Anima training; its own
-    # heavy sub-submodules (ComfyUI, HunyuanVideo, Cosmos, ...) are for other
-    # model families and are intentionally NOT pulled.
+    # Pull the diffusion_pipe submodule, plus its ComfyUI sub-submodule. ComfyUI
+    # provides the `comfy` package that diffusion-pipe's CORE code imports
+    # unconditionally (utils/dataset.py -> comfy.model_management,
+    # models/base.py -> comfy.utils/sd/sd1_clip), so it is required for ALL
+    # training, Anima included. The other sub-submodules (HunyuanVideo, Cosmos,
+    # Lumina, ...) are for model families we don't train and are NOT pulled.
     subprocess.check_call(
         "git submodule update --init diffusion_pipe", shell=PLATFORM == "linux"
+    )
+    subprocess.check_call(
+        "git -C diffusion_pipe submodule update --init submodules/ComfyUI",
+        shell=PLATFORM == "linux",
     )
 
     setup_config(

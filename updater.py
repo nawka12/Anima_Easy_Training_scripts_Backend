@@ -9,9 +9,14 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 def main():
-    # Only the diffusion_pipe submodule is needed (see installer.py); its own
-    # heavy sub-submodules are for other model families and are not pulled.
+    # diffusion_pipe submodule + its ComfyUI sub-submodule (the `comfy` package
+    # is a core dependency; see installer.py). Other sub-submodules are for model
+    # families we don't train and are not pulled.
     check_call("git submodule update --init diffusion_pipe", shell=PLATFORM == "linux")
+    check_call(
+        "git -C diffusion_pipe submodule update --init submodules/ComfyUI",
+        shell=PLATFORM == "linux",
+    )
 
     uv = ensure_uv()
     # Backend-level venv, shared by the HTTP server and the deepspeed trainer.
