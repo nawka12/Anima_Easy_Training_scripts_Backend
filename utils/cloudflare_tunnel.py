@@ -78,7 +78,7 @@ class TryCloudFlareConfig(TryCloudflare):
 
         tunnel_url = metrics_url = ""
 
-        lines = 20
+        lines = 30
         for _ in range(lines):
             line = cloudflared.stderr.readline()
 
