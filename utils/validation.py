@@ -53,7 +53,10 @@ OPTIMIZER_NAME_MAP = {
 }
 
 VALID_TIMESTEP_METHODS = {"logit_normal", "uniform"}
-VALID_LR_SCHEDULERS = {"constant", "linear", "cosine"}
+VALID_LR_SCHEDULERS = {"constant", "linear", "cosine", "wsd"}
+
+# Extra top-level keys read by train.py only when lr_scheduler = 'wsd'.
+WSD_KEYS = ("wsd_warmup_fraction", "wsd_decay_fraction", "wsd_eta_min")
 ADAPTER_TYPES = {"lora", "lokr"}
 
 
@@ -464,6 +467,18 @@ def _build_optimizer(group: dict, main: dict):
                 f"lr_scheduler '{scheduler}' is not supported "
                 f"(use one of {sorted(VALID_LR_SCHEDULERS)})"
             )
+        if scheduler == "wsd":
+            for key in WSD_KEYS:
+                value = _as_float(group.get(key))
+                if value is not None:
+                    main[key] = value
+            warmup = main.get("wsd_warmup_fraction", 0.01)
+            decay = main.get("wsd_decay_fraction", 0.10)
+            if warmup + decay > 1.0:
+                errors.append(
+                    f"wsd_warmup_fraction ({warmup}) + wsd_decay_fraction ({decay}) "
+                    f"must not exceed 1.0"
+                )
 
     force_constant = _as_float(group.get("force_constant_lr"))
     if force_constant is not None:
